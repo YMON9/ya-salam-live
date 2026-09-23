@@ -1,4 +1,4 @@
-"""Ya Salam Live: synchronized Arabic party game rooms over WebSockets."""
+"""Min Yidri: synchronized Arabic team guessing rooms over WebSockets."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from cards_v2 import CARDS as CURATED_CARDS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,6 +59,9 @@ CARDS = [
     {"type": "فكّ الشفرة", "icon": "🔐", "time": 35, "points": 3, "prompt": "وصلوا لفريقكم: «نسيت المفتاح داخل السيارة»", "hint": "4 كلمات فقط، وممنوع: مفتاح، سيارة، نسيت"},
 ]
 
+# Version 2 uses only cards that fit the one-explainer/guessing mechanic.
+CARDS = CURATED_CARDS
+
 
 @dataclass
 class Player:
@@ -72,7 +77,7 @@ class Room:
     host_id: str
     players: dict[str, Player] = field(default_factory=dict)
     phase: str = "lobby"
-    team_names: list[str] = field(default_factory=lambda: ["فريق الفُلّة", "فريق يا ساتر"])
+    team_names: list[str] = field(default_factory=lambda: ["الفريق الأصفر", "الفريق الأحمر"])
     scores: list[int] = field(default_factory=lambda: [0, 0])
     powers: list[dict[str, bool]] = field(default_factory=lambda: [
         {"double": True, "time": True}, {"double": True, "time": True}
@@ -80,16 +85,18 @@ class Room:
     total_rounds: int = 12
     round_index: int = 0
     current_team: int = 0
+    active_player_id: str | None = None
+    turn_cursors: list[int] = field(default_factory=lambda: [0, 0])
     card_index: int | None = None
     used_cards: list[int] = field(default_factory=list)
     revealed: bool = False
     deadline: float | None = None
+    paused_remaining: float | None = None
     multiplier: int = 1
-    steal_team: int | None = None
     updated_at: float = field(default_factory=time.time)
 
 
-app = FastAPI(title="Ya Salam Live")
+app = FastAPI(title="مين يدري")
 rooms: dict[str, Room] = {}
 
 
@@ -118,6 +125,13 @@ def pick_card(room: Room) -> int:
 
 def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
     card = CARDS[room.card_index] if room.card_index is not None else None
+    viewer = room.players.get(viewer_id)
+    can_see_answer = bool(
+        card
+        and room.revealed
+        and viewer
+        and (viewer.id == room.active_player_id or viewer.team != room.current_team)
+    )
     visible_card = None
     if card:
         visible_card = {
@@ -125,8 +139,8 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
             "icon": card["icon"],
             "time": card["time"],
             "points": card["points"] * room.multiplier,
-            "prompt": card["prompt"] if room.revealed else None,
-            "hint": card["hint"] if room.revealed else None,
+            "prompt": card["prompt"] if can_see_answer else None,
+            "hint": card["hint"] if can_see_answer else None,
         }
     return {
         "type": "state",
@@ -145,10 +159,12 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
         "total_rounds": room.total_rounds,
         "round_index": room.round_index,
         "current_team": room.current_team,
+        "active_player_id": room.active_player_id,
         "card": visible_card,
         "revealed": room.revealed,
         "deadline": room.deadline,
-        "steal_team": room.steal_team,
+        "paused_remaining": room.paused_remaining,
+        "can_see_answer": can_see_answer,
     }
 
 
@@ -181,12 +197,26 @@ def require_host(room: Room, player_id: str) -> bool:
     return room.host_id == player_id
 
 
+def choose_active_player(room: Room) -> None:
+    eligible = [
+        player for player in room.players.values()
+        if player.team == room.current_team and player.socket is not None
+    ]
+    if not eligible:
+        room.active_player_id = None
+        return
+    cursor = room.turn_cursors[room.current_team] % len(eligible)
+    room.active_player_id = eligible[cursor].id
+    room.turn_cursors[room.current_team] = (cursor + 1) % len(eligible)
+
+
 def start_round(room: Room) -> None:
     room.card_index = pick_card(room)
+    choose_active_player(room)
     room.revealed = False
     room.deadline = None
+    room.paused_remaining = None
     room.multiplier = 1
-    room.steal_team = None
 
 
 async def process_action(room: Room, player: Player, data: dict[str, Any]) -> None:
@@ -226,14 +256,19 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         room.powers = [{"double": True, "time": True}, {"double": True, "time": True}]
         room.round_index = 0
         room.current_team = 0
+        room.turn_cursors = [0, 0]
         room.used_cards.clear()
         start_round(room)
         await broadcast(room)
         return
 
     if action == "reveal" and room.phase == "game" and not room.revealed:
+        if room.active_player_id is None:
+            await send_error(player.socket, "لا يوجد لاعب متصل في الفريق الحالي")
+            return
         room.revealed = True
         room.deadline = time.time() + CARDS[room.card_index]["time"]
+        room.paused_remaining = None
         await broadcast(room)
         return
 
@@ -245,23 +280,30 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
             room.multiplier = 2
         elif power == "time" and room.powers[team]["time"] and room.revealed:
             room.powers[team]["time"] = False
-            room.deadline = (room.deadline or time.time()) + 15
+            if room.deadline is not None:
+                room.deadline += 15
+            elif room.paused_remaining is not None:
+                room.paused_remaining += 15
         await broadcast(room)
         return
 
-    if action == "steal" and room.phase == "game" and room.revealed:
-        room.steal_team = 1 - room.current_team
-        room.deadline = time.time() + 15
+    if action == "pause" and room.phase == "game" and room.revealed and room.deadline is not None:
+        room.paused_remaining = max(0.0, room.deadline - time.time())
+        room.deadline = None
+        await broadcast(room)
+        return
+
+    if action == "resume" and room.phase == "game" and room.revealed and room.paused_remaining is not None:
+        room.deadline = time.time() + room.paused_remaining
+        room.paused_remaining = None
         await broadcast(room)
         return
 
     if action == "resolve" and room.phase == "game":
         success = bool(data.get("success"))
         if success:
-            scoring_team = room.steal_team if room.steal_team is not None else room.current_team
+            scoring_team = room.current_team
             points = CARDS[room.card_index]["points"] * room.multiplier
-            if room.steal_team is not None:
-                points = max(1, (CARDS[room.card_index]["points"] + 1) // 2)
             room.scores[scoring_team] += points
         room.round_index += 1
         if room.round_index >= room.total_rounds:
@@ -276,8 +318,10 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
     if action == "restart" and room.phase == "end":
         room.phase = "lobby"
         room.card_index = None
+        room.active_player_id = None
         room.revealed = False
         room.deadline = None
+        room.paused_remaining = None
         await broadcast(room)
 
 
@@ -351,6 +395,8 @@ async def websocket_endpoint(socket: WebSocket) -> None:
             player.socket = None
             if room.host_id == player.id:
                 choose_new_host(room)
+            if room.phase == "game" and room.active_player_id == player.id:
+                choose_active_player(room)
             await broadcast(room)
 
 
