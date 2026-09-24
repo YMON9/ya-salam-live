@@ -110,6 +110,11 @@ class Room:
     imposter_guesses: dict[str, str] = field(default_factory=dict)
     imposters_revealed: bool = False
     imposter_answer_revealed: bool = False
+    truth_submissions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    truth_order: list[str] = field(default_factory=list)
+    truth_position: int = 0
+    truth_stage: str = "submit"
+    truth_votes: dict[str, int] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
 
 
@@ -212,6 +217,22 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
             "selected_choice": room.imposter_guesses.get(viewer_id),
             "choice_correct": (room.imposter_guesses.get(viewer_id) == room.secret_word) if viewer_id in room.imposter_guesses else None,
             "answer_revealed": room.imposter_answer_revealed,
+        }
+    if room.mode == "truth":
+        owner_id = room.truth_order[room.truth_position] if room.truth_order and room.truth_position < len(room.truth_order) else None
+        entry = room.truth_submissions.get(owner_id or "")
+        revealed = room.truth_stage == "reveal"
+        result["truth"] = {
+            "stage": room.truth_stage,
+            "submitted_ids": list(room.truth_submissions),
+            "position": room.truth_position,
+            "total": len(room.truth_order),
+            "statements": entry["statements"] if entry and room.truth_stage in ("guess", "reveal") else [],
+            "is_yours": owner_id == viewer_id,
+            "owner_id": owner_id if revealed else None,
+            "lie_index": entry["lie_index"] if entry and revealed else None,
+            "voted_ids": list(room.truth_votes),
+            "votes": room.truth_votes if revealed else {},
         }
     return result
 
@@ -321,6 +342,27 @@ def reset_to_lobby(room: Room) -> None:
     room.secret_word = None
     room.imposter_ids.clear(); room.imposter_options.clear(); room.imposter_guesses.clear()
     room.imposters_revealed = room.imposter_answer_revealed = False
+    room.truth_submissions.clear(); room.truth_order.clear(); room.truth_votes.clear()
+    room.truth_position = 0; room.truth_stage = "submit"
+
+
+def start_truth_rounds(room: Room) -> None:
+    room.truth_order = list(room.truth_submissions)
+    random.shuffle(room.truth_order)
+    room.truth_position = 0
+    room.truth_stage = "guess"
+    room.truth_votes.clear()
+
+
+def reveal_truth(room: Room) -> None:
+    if room.truth_stage != "guess" or not room.truth_order:
+        return
+    owner_id = room.truth_order[room.truth_position]
+    lie_index = room.truth_submissions[owner_id]["lie_index"]
+    for voter_id, choice in room.truth_votes.items():
+        if choice == lie_index and voter_id in room.personal_scores:
+            room.personal_scores[voter_id] += 1
+    room.truth_stage = "reveal"
 
 
 async def process_action(room: Room, player: Player, data: dict[str, Any]) -> None:
@@ -345,7 +387,7 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
 
     if action == "set_mode" and room.phase == "lobby" and require_host(room, player.id):
         mode = str(data.get("mode"))
-        if mode in ("team", "emoji", "imposter"):
+        if mode in ("team", "emoji", "imposter", "truth"):
             room.mode = mode
             await broadcast(room)
         return
@@ -375,6 +417,35 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
             await broadcast(room)
         return
 
+    if action == "submit_truths" and room.phase == "game" and room.mode == "truth" and room.truth_stage == "submit":
+        raw = data.get("statements", [])
+        if not isinstance(raw, list) or len(raw) != 3:
+            await send_error(player.socket, "اكتب ثلاثة مواقف")
+            return
+        statements = [" ".join(str(x).strip().split())[:140] for x in raw]
+        try: lie_index = int(data.get("lie_index", -1))
+        except (TypeError, ValueError): lie_index = -1
+        if not all(len(x) >= 3 for x in statements) or lie_index not in (0, 1, 2):
+            await send_error(player.socket, "كمّل المواقف وحدد الموقف الخيالي")
+            return
+        room.truth_submissions[player.id] = {"statements": statements, "lie_index": lie_index}
+        connected_ids = {p.id for p in room.players.values() if p.socket is not None}
+        if connected_ids and connected_ids.issubset(room.truth_submissions):
+            start_truth_rounds(room)
+        await broadcast(room)
+        return
+
+    if action == "vote_truth" and room.phase == "game" and room.mode == "truth" and room.truth_stage == "guess":
+        choice = int(data.get("choice", -1))
+        owner_id = room.truth_order[room.truth_position]
+        if player.id != owner_id and choice in (0, 1, 2):
+            room.truth_votes[player.id] = choice
+            eligible = {p.id for p in room.players.values() if p.socket is not None and p.id != owner_id}
+            if eligible and eligible.issubset(room.truth_votes):
+                reveal_truth(room)
+            await broadcast(room)
+        return
+
     if not require_host(room, player.id):
         await send_error(player.socket, "هذا الزر عند المضيف فقط")
         return
@@ -398,7 +469,7 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
 
     if action == "start" and room.phase == "lobby":
         connected = [p for p in room.players.values() if p.socket is not None]
-        minimum = 3 if room.mode == "imposter" else 2
+        minimum = 3 if room.mode in ("imposter", "truth") else 2
         if len(connected) < minimum:
             await send_error(player.socket, f"هذه اللعبة تحتاج {minimum} لاعبين متصلين على الأقل")
             return
@@ -419,7 +490,10 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         elif room.mode == "emoji":
             room.used_puzzles.clear(); start_emoji_round(room)
         else:
-            start_imposter_round(room)
+            if room.mode == "imposter": start_imposter_round(room)
+            else:
+                room.truth_submissions.clear(); room.truth_order.clear(); room.truth_votes.clear()
+                room.truth_stage = "submit"; room.truth_position = 0
         await broadcast(room)
         return
 
@@ -506,6 +580,17 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         room.round_index += 1
         if room.round_index >= room.total_rounds: room.phase = "end"
         else: start_imposter_round(room)
+        await broadcast(room); return
+
+    if action == "reveal_truth" and room.phase == "game" and room.mode == "truth":
+        reveal_truth(room)
+        await broadcast(room); return
+
+    if action == "next_truth" and room.phase == "game" and room.mode == "truth" and room.truth_stage == "reveal":
+        room.truth_position += 1
+        room.truth_votes.clear()
+        if room.truth_position >= len(room.truth_order): room.phase = "end"
+        else: room.truth_stage = "guess"
         await broadcast(room); return
 
     if action == "restart" and room.phase == "end":
