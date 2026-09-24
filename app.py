@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from cards_v2 import CARDS as CURATED_CARDS
+from mini_games import EMOJI_PUZZLES, IMPOSTER_WORDS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -77,6 +78,7 @@ class Room:
     host_id: str
     players: dict[str, Player] = field(default_factory=dict)
     phase: str = "lobby"
+    mode: str = "team"
     team_names: list[str] = field(default_factory=lambda: ["الفريق الأصفر", "الفريق الأحمر"])
     scores: list[int] = field(default_factory=lambda: [0, 0])
     powers: list[dict[str, bool]] = field(default_factory=lambda: [
@@ -93,6 +95,20 @@ class Room:
     deadline: float | None = None
     paused_remaining: float | None = None
     multiplier: int = 1
+    personal_scores: dict[str, int] = field(default_factory=dict)
+    puzzle_index: int | None = None
+    used_puzzles: list[int] = field(default_factory=list)
+    guesses: dict[str, str] = field(default_factory=dict)
+    emoji_answer_revealed: bool = False
+    imposter_category: str = "عشوائي"
+    imposter_count: int = 1
+    secret_word: str | None = None
+    imposter_ids: list[str] = field(default_factory=list)
+    role_deadline: float | None = None
+    imposter_options: list[str] = field(default_factory=list)
+    imposter_guesses: dict[str, str] = field(default_factory=dict)
+    imposters_revealed: bool = False
+    imposter_answer_revealed: bool = False
     updated_at: float = field(default_factory=time.time)
 
 
@@ -142,13 +158,14 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
             "prompt": card["prompt"] if can_see_answer else None,
             "hint": card["hint"] if can_see_answer else None,
         }
-    return {
+    result = {
         "type": "state",
         "server_time": time.time(),
         "room": room.code,
         "you": viewer_id,
         "host_id": room.host_id,
         "phase": room.phase,
+        "mode": room.mode,
         "players": [
             {"id": p.id, "name": p.name, "team": p.team, "connected": p.socket is not None}
             for p in room.players.values()
@@ -165,7 +182,37 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
         "deadline": room.deadline,
         "paused_remaining": room.paused_remaining,
         "can_see_answer": can_see_answer,
+        "personal_scores": room.personal_scores,
+        "imposter_category": room.imposter_category,
+        "imposter_count": room.imposter_count,
     }
+    if room.mode == "emoji" and room.puzzle_index is not None:
+        puzzle = EMOJI_PUZZLES[room.puzzle_index]
+        show_all_guesses = viewer_id == room.host_id or room.emoji_answer_revealed
+        result["emoji"] = {
+            "category": puzzle["category"],
+            "clue": puzzle["clue"],
+            "answer": puzzle["answer"] if (viewer_id == room.host_id or room.emoji_answer_revealed) else None,
+            "answer_revealed": room.emoji_answer_revealed,
+            "guesses": room.guesses if show_all_guesses else {
+                pid: (guess if pid == viewer_id else "تم إرسال التخمين")
+                for pid, guess in room.guesses.items()
+            },
+        }
+    if room.mode == "imposter" and room.secret_word:
+        is_imposter = viewer_id in room.imposter_ids
+        result["imposter"] = {
+            "category": room.imposter_category,
+            "your_role": "imposter" if is_imposter else "knows",
+            "word": room.secret_word if (not is_imposter or room.imposter_answer_revealed) else None,
+            "role_deadline": room.role_deadline,
+            "imposters_revealed": room.imposters_revealed,
+            "imposter_ids": room.imposter_ids if room.imposters_revealed else [],
+            "options": room.imposter_options if (is_imposter and room.imposters_revealed) else [],
+            "guesses": room.imposter_guesses if room.imposter_answer_revealed else {},
+            "answer_revealed": room.imposter_answer_revealed,
+        }
+    return result
 
 
 async def send_error(socket: WebSocket, message: str) -> None:
@@ -219,6 +266,50 @@ def start_round(room: Room) -> None:
     room.multiplier = 1
 
 
+def pick_puzzle(room: Room) -> int:
+    available = [i for i in range(len(EMOJI_PUZZLES)) if i not in room.used_puzzles]
+    if not available:
+        room.used_puzzles.clear()
+        available = list(range(len(EMOJI_PUZZLES)))
+    index = random.choice(available)
+    room.used_puzzles.append(index)
+    return index
+
+
+def start_emoji_round(room: Room) -> None:
+    room.puzzle_index = pick_puzzle(room)
+    room.guesses.clear()
+    room.emoji_answer_revealed = False
+
+
+def start_imposter_round(room: Room) -> None:
+    connected = [p for p in room.players.values() if p.socket is not None]
+    category = room.imposter_category
+    if category == "عشوائي" or category not in IMPOSTER_WORDS:
+        category = random.choice(list(IMPOSTER_WORDS))
+    room.imposter_category = category
+    room.secret_word = random.choice(IMPOSTER_WORDS[category])
+    room.imposter_ids = [p.id for p in random.sample(connected, min(room.imposter_count, len(connected) - 1))]
+    wrong = [w for w in IMPOSTER_WORDS[category] if w != room.secret_word]
+    room.imposter_options = random.sample(wrong, 3) + [room.secret_word]
+    random.shuffle(room.imposter_options)
+    room.role_deadline = time.time() + 15
+    room.imposter_guesses.clear()
+    room.imposters_revealed = room.imposter_answer_revealed = False
+
+
+def reset_to_lobby(room: Room) -> None:
+    room.phase = "lobby"
+    room.round_index = 0
+    room.card_index = room.puzzle_index = None
+    room.active_player_id = None
+    room.revealed = room.emoji_answer_revealed = False
+    room.deadline = room.paused_remaining = None
+    room.secret_word = None
+    room.imposter_ids.clear(); room.imposter_options.clear(); room.imposter_guesses.clear()
+    room.imposters_revealed = room.imposter_answer_revealed = False
+
+
 async def process_action(room: Room, player: Player, data: dict[str, Any]) -> None:
     action = data.get("action")
     if action == "ping":
@@ -239,30 +330,83 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
             await broadcast(room)
         return
 
+    if action == "set_mode" and room.phase == "lobby" and require_host(room, player.id):
+        mode = str(data.get("mode"))
+        if mode in ("team", "emoji", "imposter"):
+            room.mode = mode
+            await broadcast(room)
+        return
+
+    if action == "set_imposter" and room.phase == "lobby" and require_host(room, player.id):
+        category = str(data.get("category", "عشوائي"))
+        room.imposter_category = category if category == "عشوائي" or category in IMPOSTER_WORDS else "عشوائي"
+        room.imposter_count = 2 if int(data.get("count", 1)) == 2 else 1
+        await broadcast(room)
+        return
+
+    if action == "submit_guess" and room.phase == "game" and room.mode == "emoji":
+        guess = " ".join(str(data.get("guess", "")).strip().split())[:40]
+        if guess:
+            room.guesses[player.id] = guess
+            await broadcast(room)
+        return
+
+    if action == "submit_imposter_choice" and room.phase == "game" and room.mode == "imposter":
+        choice = str(data.get("choice", ""))
+        if player.id in room.imposter_ids and choice in room.imposter_options:
+            room.imposter_guesses[player.id] = choice
+            await broadcast(room)
+        return
+
     if not require_host(room, player.id):
         await send_error(player.socket, "هذا الزر عند المضيف فقط")
         return
 
+    if action == "return_lobby":
+        reset_to_lobby(room)
+        await broadcast(room)
+        return
+
+    if action == "close_room":
+        for p in list(room.players.values()):
+            if p.socket:
+                try:
+                    await p.socket.send_json({"type": "room_closed", "message": "المضيف أنهى الغرفة"})
+                    await p.socket.close()
+                except Exception:
+                    pass
+                p.socket = None
+        rooms.pop(room.code, None)
+        return
+
     if action == "start" and room.phase == "lobby":
         connected = [p for p in room.players.values() if p.socket is not None]
-        teams_present = {p.team for p in connected}
-        if len(connected) < 2 or teams_present != {0, 1}:
-            await send_error(player.socket, "لازم لاعبان متصلان على الأقل، ولاعب في كل فريق")
+        minimum = 3 if room.mode == "imposter" else 2
+        if len(connected) < minimum:
+            await send_error(player.socket, f"هذه اللعبة تحتاج {minimum} لاعبين متصلين على الأقل")
+            return
+        if room.mode == "team" and {p.team for p in connected} != {0, 1}:
+            await send_error(player.socket, "لازم لاعب في كل فريق")
             return
         rounds = int(data.get("rounds", 12))
-        room.total_rounds = rounds if rounds in (8, 12, 16) else 12
+        room.total_rounds = rounds if rounds in (5, 8, 10, 12, 16) else 8
         room.phase = "game"
+        room.personal_scores = {p.id: 0 for p in connected}
         room.scores = [0, 0]
         room.powers = [{"double": True, "time": True}, {"double": True, "time": True}]
         room.round_index = 0
         room.current_team = 0
         room.turn_cursors = [0, 0]
-        room.used_cards.clear()
-        start_round(room)
+        if room.mode == "team":
+            room.used_cards.clear(); start_round(room)
+        elif room.mode == "emoji":
+            room.used_puzzles.clear(); start_emoji_round(room)
+        else:
+            start_imposter_round(room)
         await broadcast(room)
         return
 
-    if action == "reveal" and room.phase == "game" and not room.revealed:
+    if action == "reveal" and room.phase == "game" and room.mode == "team" and not room.revealed:
         if room.active_player_id is None:
             await send_error(player.socket, "لا يوجد لاعب متصل في الفريق الحالي")
             return
@@ -272,7 +416,7 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         await broadcast(room)
         return
 
-    if action == "power" and room.phase == "game":
+    if action == "power" and room.phase == "game" and room.mode == "team":
         power = data.get("power")
         team = room.current_team
         if power == "double" and room.powers[team]["double"]:
@@ -287,19 +431,19 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         await broadcast(room)
         return
 
-    if action == "pause" and room.phase == "game" and room.revealed and room.deadline is not None:
+    if action == "pause" and room.phase == "game" and room.mode == "team" and room.revealed and room.deadline is not None:
         room.paused_remaining = max(0.0, room.deadline - time.time())
         room.deadline = None
         await broadcast(room)
         return
 
-    if action == "resume" and room.phase == "game" and room.revealed and room.paused_remaining is not None:
+    if action == "resume" and room.phase == "game" and room.mode == "team" and room.revealed and room.paused_remaining is not None:
         room.deadline = time.time() + room.paused_remaining
         room.paused_remaining = None
         await broadcast(room)
         return
 
-    if action == "resolve" and room.phase == "game":
+    if action == "resolve" and room.phase == "game" and room.mode == "team":
         success = bool(data.get("success"))
         if success:
             scoring_team = room.current_team
@@ -315,19 +459,50 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         await broadcast(room)
         return
 
+    if action == "reveal_emoji" and room.phase == "game" and room.mode == "emoji":
+        room.emoji_answer_revealed = True
+        await broadcast(room); return
+
+    if action == "award_guess" and room.phase == "game" and room.mode == "emoji":
+        winner = str(data.get("player_id", ""))
+        if winner in room.personal_scores: room.personal_scores[winner] += 1
+        room.round_index += 1
+        if room.round_index >= room.total_rounds: room.phase = "end"
+        else: start_emoji_round(room)
+        await broadcast(room); return
+
+    if action == "reveal_imposters" and room.phase == "game" and room.mode == "imposter":
+        room.imposters_revealed = True
+        await broadcast(room); return
+
+    if action == "reveal_imposter_answer" and room.phase == "game" and room.mode == "imposter":
+        room.imposter_answer_revealed = True
+        await broadcast(room); return
+
+    if action == "award_person" and room.phase == "game" and room.mode == "imposter":
+        winner = str(data.get("player_id", ""))
+        if winner in room.personal_scores: room.personal_scores[winner] += 1
+        await broadcast(room); return
+
+    if action == "next_imposter" and room.phase == "game" and room.mode == "imposter":
+        room.round_index += 1
+        if room.round_index >= room.total_rounds: room.phase = "end"
+        else: start_imposter_round(room)
+        await broadcast(room); return
+
     if action == "restart" and room.phase == "end":
-        room.phase = "lobby"
-        room.card_index = None
-        room.active_player_id = None
-        room.revealed = False
-        room.deadline = None
-        room.paused_remaining = None
+        reset_to_lobby(room)
         await broadcast(room)
 
 
 @app.get("/")
 async def home() -> HTMLResponse:
     return HTMLResponse((ROOT / "index.html").read_text(encoding="utf-8"))
+
+
+@app.get("/game.js")
+async def game_script() -> Response:
+    return Response((ROOT / "game.js").read_text(encoding="utf-8"), media_type="application/javascript")
 
 
 @app.get("/health")
@@ -397,7 +572,8 @@ async def websocket_endpoint(socket: WebSocket) -> None:
                 choose_new_host(room)
             if room.phase == "game" and room.active_player_id == player.id:
                 choose_active_player(room)
-            await broadcast(room)
+            if room.code in rooms:
+                await broadcast(room)
 
 
 async def cleanup_rooms() -> None:
