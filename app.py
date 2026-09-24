@@ -100,6 +100,7 @@ class Room:
     used_puzzles: list[int] = field(default_factory=list)
     guesses: dict[str, str] = field(default_factory=dict)
     emoji_answer_revealed: bool = False
+    emoji_deadline: float | None = None
     imposter_category: str = "عشوائي"
     imposter_count: int = 1
     secret_word: str | None = None
@@ -188,16 +189,14 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
     }
     if room.mode == "emoji" and room.puzzle_index is not None:
         puzzle = EMOJI_PUZZLES[room.puzzle_index]
-        show_all_guesses = viewer_id == room.host_id or room.emoji_answer_revealed
         result["emoji"] = {
             "category": puzzle["category"],
             "clue": puzzle["clue"],
-            "answer": puzzle["answer"] if (viewer_id == room.host_id or room.emoji_answer_revealed) else None,
+            "answer": puzzle["answer"] if room.emoji_answer_revealed else None,
             "answer_revealed": room.emoji_answer_revealed,
-            "guesses": room.guesses if show_all_guesses else {
-                pid: (guess if pid == viewer_id else "تم إرسال التخمين")
-                for pid, guess in room.guesses.items()
-            },
+            "deadline": room.emoji_deadline,
+            "submitted_ids": list(room.guesses),
+            "guesses": room.guesses if room.emoji_answer_revealed else {},
         }
     if room.mode == "imposter" and room.secret_word:
         is_imposter = viewer_id in room.imposter_ids
@@ -210,6 +209,8 @@ def public_state(room: Room, viewer_id: str) -> dict[str, Any]:
             "imposter_ids": room.imposter_ids if room.imposters_revealed else [],
             "options": room.imposter_options if (is_imposter and room.imposters_revealed) else [],
             "guesses": room.imposter_guesses if room.imposter_answer_revealed else {},
+            "selected_choice": room.imposter_guesses.get(viewer_id),
+            "choice_correct": (room.imposter_guesses.get(viewer_id) == room.secret_word) if viewer_id in room.imposter_guesses else None,
             "answer_revealed": room.imposter_answer_revealed,
         }
     return result
@@ -280,6 +281,17 @@ def start_emoji_round(room: Room) -> None:
     room.puzzle_index = pick_puzzle(room)
     room.guesses.clear()
     room.emoji_answer_revealed = False
+    room.emoji_deadline = time.time() + 30
+    asyncio.create_task(reveal_emoji_after_timeout(room, room.puzzle_index))
+
+
+async def reveal_emoji_after_timeout(room: Room, puzzle_index: int) -> None:
+    await asyncio.sleep(30.1)
+    if (room.code in rooms and room.phase == "game" and room.mode == "emoji"
+            and room.puzzle_index == puzzle_index and not room.emoji_answer_revealed):
+        room.emoji_answer_revealed = True
+        room.emoji_deadline = None
+        await broadcast(room)
 
 
 def start_imposter_round(room: Room) -> None:
@@ -304,6 +316,7 @@ def reset_to_lobby(room: Room) -> None:
     room.card_index = room.puzzle_index = None
     room.active_player_id = None
     room.revealed = room.emoji_answer_revealed = False
+    room.emoji_deadline = None
     room.deadline = room.paused_remaining = None
     room.secret_word = None
     room.imposter_ids.clear(); room.imposter_options.clear(); room.imposter_guesses.clear()
@@ -348,6 +361,10 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
         guess = " ".join(str(data.get("guess", "")).strip().split())[:40]
         if guess:
             room.guesses[player.id] = guess
+            connected_ids = {p.id for p in room.players.values() if p.socket is not None}
+            if connected_ids and connected_ids.issubset(room.guesses):
+                room.emoji_answer_revealed = True
+                room.emoji_deadline = None
             await broadcast(room)
         return
 
@@ -461,6 +478,7 @@ async def process_action(room: Room, player: Player, data: dict[str, Any]) -> No
 
     if action == "reveal_emoji" and room.phase == "game" and room.mode == "emoji":
         room.emoji_answer_revealed = True
+        room.emoji_deadline = None
         await broadcast(room); return
 
     if action == "award_guess" and room.phase == "game" and room.mode == "emoji":
@@ -560,6 +578,8 @@ async def websocket_endpoint(socket: WebSocket) -> None:
         while True:
             data = await socket.receive_json()
             await process_action(room, player, data)
+            if room.code not in rooms:
+                return
     except (WebSocketDisconnect, asyncio.TimeoutError):
         pass
     except (ValueError, TypeError, json.JSONDecodeError):

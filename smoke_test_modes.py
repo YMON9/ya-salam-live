@@ -28,11 +28,14 @@ async def main():
     code,s=await join_group(["شهد","ريم","سارة","نور"]); host=s[0]
     await send(host,"set_mode",mode="emoji"); states=[await recv_state(x) for x in s]
     await send(host,"start",rounds=5); states=[await recv_state(x) for x in s]
-    assert states[0]["emoji"]["answer"] and states[1]["emoji"]["answer"] is None
+    assert all(x["emoji"]["answer"] is None for x in states)
     await send(s[1],"submit_guess",guess="تجربة"); states=[await recv_state(x) for x in s]
-    assert states[0]["emoji"]["guesses"][states[1]["you"]] == "تجربة"
-    await send(host,"reveal_emoji"); states=[await recv_state(x) for x in s]
+    assert all(not x["emoji"]["guesses"] for x in states)
+    for i, ws in enumerate((s[0], s[2], s[3])):
+        await send(ws,"submit_guess",guess=f"تخمين {i}")
+        states=[await recv_state(x) for x in s]
     assert all(x["emoji"]["answer"] for x in states)
+    assert len(states[0]["emoji"]["guesses"]) == 4
     await send(host,"award_guess",player_id=states[1]["you"]); states=[await recv_state(x) for x in s]
     assert states[0]["personal_scores"][states[1]["you"]] == 1
     await send(host,"return_lobby"); states=[await recv_state(x) for x in s]; assert all(x["phase"]=="lobby" for x in states)
@@ -47,6 +50,9 @@ async def main():
     assert len(imp["imposter"]["options"])==4
     imp_ws=s[states.index(imp)]; choice=imp["imposter"]["options"][0]
     await send(imp_ws,"submit_imposter_choice",choice=choice); states=[await recv_state(x) for x in s]
+    imp_after=next(x for x in states if x["imposter"]["your_role"]=="imposter")
+    assert imp_after["imposter"]["selected_choice"] == choice
+    assert imp_after["imposter"]["choice_correct"] in (True, False)
     await send(host,"reveal_imposter_answer"); states=[await recv_state(x) for x in s]
     assert all(x["imposter"]["answer_revealed"] for x in states)
     await send(host,"close_room")
